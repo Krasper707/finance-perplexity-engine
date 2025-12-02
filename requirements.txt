@@ -5,3 +5,6 @@ tavily-python
 yfinance
 openai
 yfinance
+pandas
+streamlit 
+requests

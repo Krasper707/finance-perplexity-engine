@@ -3,8 +3,12 @@ import yfinance as yf
 from dotenv import load_dotenv
 from tavily import TavilyClient
 from openai import OpenAI
-
-# 1. Load Keys
+import pandas as pd
+import time
+import asyncio 
+# The Cache: Stores { "TICKER": { "report": "...", "time": 12345 } }
+REPORT_CACHE = {}
+CACHE_DURATION = 60 # seconds
 load_dotenv()
 
 # 2. Setup Clients
@@ -13,103 +17,93 @@ llm_client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
+def calculate_rsi(data, window=14):
+    """Calculates the Relative Strength Index (Technical Indicator)."""
+    delta = data['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi.iloc[-1]
 
-# --- TOOL 1: GET NUMBERS ---
-def get_stock_data(ticker):
-    try:
+async def get_stock_data_async(ticker):
+    print("   -> Fetching Stocks...")
+    def fetch():
         stock = yf.Ticker(ticker)
-        # Get 5 days of data
-        hist = stock.history(period="5d")
-        
-        if hist.empty:
-            return "No price data available."
-            
-        # Format it nicely for the LLM
-        data_str = "Recent Price History:\n"
-        for date, row in hist.iterrows():
-            date_str = date.strftime('%Y-%m-%d')
-            close_price = round(row['Close'], 2)
-            data_str += f"- {date_str}: ${close_price}\n"
-        return data_str
-    except Exception as e:
-        return f"Error getting stock data: {e}"
+        hist = stock.history(period="1mo")
+        return hist
+    
+    hist = await asyncio.to_thread(fetch)
+    
+    if hist.empty: return "No data."
+    
+    # Math logic
+    current = hist['Close'].iloc[-1]
+    prev = hist['Close'].iloc[-2]
+    change = ((current - prev) / prev) * 100
+    rsi = calculate_rsi(hist)
+    
+    return f"Price: ${current:.2f}\nChange: {change:.2f}%\nRSI: {rsi:.2f}"
 
-# --- TOOL 2: GET NEWS ---
-def get_market_news(query):
-    try:
-        # Search specifically for news
-        response = tavily_client.search(
-            query=query, 
-            search_depth="basic", 
-            max_results=3,
-            topic="news" # Tavily has a specific 'news' topic optimized for this
-        )
-        
-        context = "Recent News Sources:\n"
-        for i, result in enumerate(response['results']):
-            # We explicitly label the Source ID [1] here
-            context += f"Source [{i+1}]: {result['title']}\n"
-            context += f"URL: {result['url']}\n"
-            context += f"Snippet: {result['content']}\n\n"
-            
-        return context
-    except Exception as e:
-        return f"Error getting news: {e}"
 
-# --- THE AGENT ---
-def generate_report(ticker):
-    print(f"\n Starting analysis for: {ticker}...")
+async def get_news_async(ticker):
+    print("   -> Fetching News...")
+    def fetch():
+        return tavily_client.search(query=f"Why is {ticker} moving?", topic="news", max_results=3)
     
-    # 1. Gather Intelligence (Parallel-ish)
-    print("1. Fetching Price Data...")
-    price_data = get_stock_data(ticker)
+    response = await asyncio.to_thread(fetch)
     
-    print("2. Searching News...")
-    news_data = get_market_news(f"Why is {ticker} stock moving today?")
+    # Format
+    context = ""
+    sources = []
+    for i, res in enumerate(response['results']):
+        context += f"[{i+1}] {res['title']}: {res['content']}\n"
+        sources.append({"id": i+1, "title": res['title'], "url": res['url']})
+        
+    return context, sources
+async def generate_report(ticker):
+    start = time.time()
     
-    # 2. Build the Prompt
-    # We tell the LLM exactly how to behave
-    system_instruction = """
-    You are a Financial Analyst AI. 
-    Your goal is to explain the stock trend using the provided data and news.
+    # Check Cache
+    if ticker in REPORT_CACHE and (start - REPORT_CACHE[ticker]['time'] < CACHE_DURATION):
+        print("⚡ CACHE HIT")
+        return REPORT_CACHE[ticker]['report']
+
+    print(f"🚀 Analyzing {ticker}...")
+
+    # --- THE MAGIC: RUN TOGETHER ---
+    # This launches both functions at the exact same moment
+    stock_task = get_stock_data_async(ticker)
+    news_task = get_news_async(ticker)
     
-    RULES:
-    1. Cite your sources using [1], [2] format strictly based on the 'Recent News Sources' provided.
-    2. Do not invent URLs. Only use the ones provided.
-    3. Keep the answer concise (under 150 words).
-    4. First explain the price movement (from the data), then explain the cause (from the news).
-    """
+    # Wait for both to finish
+    price_data, (news_context, sources) = await asyncio.gather(stock_task, news_task)
     
-    user_prompt = f"""
-    DATA:
-    {price_data}
+    print(f"✅ Data collected in {time.time() - start:.2f}s")
+
+    # LLM Call (Standard)
+    system = "You are a Financial Analyst. Cite sources [1]. Combine technicals and news."
+    prompt = f"TECHNICALS:\n{price_data}\n\nNEWS:\n{news_context}"
     
-    NEWS:
-    {news_data}
-    
-    Task: Analyze {ticker}.
-    """
-    
-    # 3. Ask the Brain
-    print("3. Synthesizing Report...")
     response = llm_client.chat.completions.create(
         model= "openai/gpt-oss-20b:free",
-
-        messages=[
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": user_prompt}
-        ]
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}]
     )
     
-    return response.choices[0].message.content
+    final = response.choices[0].message.content
+    
+    # Update Cache
+    REPORT_CACHE[ticker] = {"report": final, "time": time.time()}
+    return final
 
+# --- RUN LOOP ---
 if __name__ == "__main__":
-    # You can change this to "TSLA", "GOOGL", "BTC-USD"
-    ticker_input = "AAPL" 
-    
-    final_report = generate_report(ticker_input)
-    
-    print("\n" + "="*40)
-    print(f"📊 REPORT FOR {ticker_input}")
-    print("="*40 + "\n")
-    print(final_report)
+    while True:
+        ticker = input("\nTicker: ").strip().upper()
+        if not ticker: break
+        
+        # Asyncio entry point
+        report = asyncio.run(generate_report(ticker))
+        print("\n" + report)
