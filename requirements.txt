@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+langchain
+tavily-python
+yfinance
+openai
+yfinance
